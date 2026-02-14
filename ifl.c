@@ -11,7 +11,6 @@
 #define SET_HEADER(size, set_flag)  ((size<<0x4) | set_flag)
 #define DEBUG_PRINT(n)              printf("DEBUG VALUE %x\n", n)
 #define DEBUG_PRINT_PTR(n)          printf("DEBUG POINTER %p\n", n)
-
 // Implicit free list implementation 
 
 // prologue + epilogue
@@ -22,42 +21,18 @@
 typedef struct Block 
 {
     uint64_t header; // last 4 bits -> allocation status
-    unsigned char payload[0]; // this will contain the footer too
+    unsigned char payload[0];
 } block_t;
 
-bool malloc_init()
-{
+bool malloc_init();
+void* my_malloc(size_t);
+void my_free(void*);
+uint64_t get_size(block_t*);
+uint64_t get_alloc_status(block_t*);
 
-    block_t* prologue = (block_t*) sbrk(16);
-    prologue->header = SET_HEADER(0, 1);
-
-    block_t* epilogue = sbrk(16);
-    epilogue->header = SET_HEADER(0, 1);
-
-    return true;
-}
-
-void* my_malloc(size_t sz)
-{
-    int alloc_size = ALIGN_UP(sz, 16) + HEADER_SIZE + FOOTER_SIZE;
-    block_t* new_alloc = sbrk(alloc_size);
-    uint64_t* footer = (uint64_t*)((char*)new_alloc + alloc_size - FOOTER_SIZE); 
-
-    new_alloc->header = SET_HEADER(alloc_size, 0x1);
-    *footer = new_alloc->header;
-
-    return ((uint64_t*)new_alloc+1);
-}
-
-void free(void* alloc)
-{
-    block_t* alloc_start = (block_t*)((uint64_t*)alloc - 1);
-    int size = alloc_start->header>>0x4;
-    uint64_t* footer = (uint64_t*)((char*)alloc_start + (alloc_start->header>>0x4) - FOOTER_SIZE);
-
-    alloc_start->header &= ~0xF; 
-    *footer &= ~0xF;
-}
+static block_t* alloc_head = NULL;
+static block_t* pl = NULL;
+static block_t* el = NULL;
 
 int main()
 {
@@ -68,48 +43,138 @@ int main()
         start = true;
     }
 
-    int* alloc1 = NULL;
-    int* alloc2 = NULL;
+    int* alloc1 = (int*)(my_malloc(sizeof(int)));
+    int* alloc2 = (int*)(my_malloc(2));
     int num = 4;
 
-    alloc1 = (int*)(my_malloc(sizeof(int)));
-
-    *alloc1 = num;
-
-    alloc2 = (int*)(my_malloc(2));
-
-    free((void*)alloc1);
-    free((void*)alloc1);
-
-//-------------------------------------------------------END----------------------------------------------------------------//
+    *alloc1 = 4;
+    *alloc2 = 33;
+    my_free((void*)alloc1);
+    // my_free((void*)alloc2);
+    int* alloc3 = (int*)(my_malloc(sizeof(int)));
     void* end = sbrk(0);
-    // printf("prolg address               = %p \n", prolg);
-    // printf("prolg->header address = %p \n", &(prolg->header));
-    // printf("prolg->payload address = %p \n", &(prolg->payload)); 
     
-    printf("alloc1 address              = %p \n", alloc1);
-    // printf("alloc1->header address      = %p \n", (void*)&(alloc1->header));
-    // printf("alloc1->payload address     = %p \n", (void*)&(alloc1->payload)); 
-    // printf("alloc1->footer address      = %p \n", (void*)((char*)alloc1 + aligned_sz - HEADER_SIZE));
+}
 
-    // printf("num address = %p \n", num);
-    // printf("Address of num: %p matches address of alloc1->payload: %p \n", num, (void*)(alloc1+1));
-    // printf("num: %p matches alloc1->payload: %p \n", *num, alloc1->payload[0]);
+uint64_t get_size(block_t* block)
+{
+    return (uint64_t)(block->header>>0x4);
+}
 
-    printf("alloc2 address              = %p \n", alloc2);
-    // printf("alloc2->header address      = %p \n", (void*)&(alloc2->header));
-    // printf("alloc2->payload address     = %p \n", (void*)&(alloc2->payload)); 
-    // printf("alloc2->footer address      = %p \n", (void*)footer);
+uint64_t get_alloc_status(block_t* block)
+{
+    return (uint64_t)(block->header & 0xF);
+}
+
+block_t* next_block(block_t* block)
+{
+    return (block_t*)((char*)(block) + get_size(block));
+}
+
+bool malloc_init()
+{
+// PADDING | PROLOGUE HEADER | PROLOGUE FOOTER | EPILOGUE HEADER
+    block_t* start = (block_t*) sbrk(8 * 4); 
+    pl = (block_t*)((char*)start + 8);
+    pl->header = SET_HEADER(16, 1);
+
+    block_t* epilogue = (block_t*)((char*)pl + 16);
+    el = epilogue;
+    epilogue->header = SET_HEADER(0, 1);
+
+    alloc_head = (block_t*)((char*)pl + 16);
+    return true;
+}
+
+void split(block_t* head, uint64_t old_size, uint64_t new_size)
+{   
+    uint64_t remaining_size = old_size - new_size;
+    if (remaining_size < 16) {
+        head->header = SET_HEADER(old_size, 1);
+        block_t* footer = (block_t*)((char*)head + old_size - FOOTER_SIZE);
+        footer->header = SET_HEADER(old_size, 1);
+        return;
+    }
+
+    head->header = SET_HEADER(new_size, 1);
+
+    block_t* footer = (block_t*)((char*)head + new_size - FOOTER_SIZE);
+    footer->header = SET_HEADER(new_size, 1);
+
+    block_t* new_block = (block_t*)((char*)head + new_size);
+    new_block->header = SET_HEADER(remaining_size, 0);
+
+    footer = (block_t*)((char*)new_block + remaining_size -FOOTER_SIZE);
+    footer->header = SET_HEADER(remaining_size, 0);
+}
+
+void allocate(block_t* head, uint64_t size)
+{
+    int old_size = get_size(head);
+    if (old_size > size) // update this to ensure the min block size is respected
+    {
+        split(head, old_size, size);
+    }
+    else
+    {
+        head->header = SET_HEADER(size, 1);
+    }
+}
+
+block_t* extend_heap(uint64_t size)
+{
+    block_t* new_alloc = el;
     
-    // printf("alloc3 address              = %p \n", alloc3);
-    // printf("alloc3->header address      = %p \n", (void*)&(alloc3->header));
-    // printf("alloc3->payload address     = %p \n", (void*)&(alloc3->payload)); 
-    // printf("alloc3->footer address      = %p \n", (void*)footer3);
+    if (sbrk(size) == (void*)-1)
+        return NULL;
 
-    // printf("alloc4 address              = %p \n", alloc4);
-    // printf("alloc4->header address      = %p \n", (void*)&(alloc4->header));
-    // printf("alloc4->payload address     = %p \n", (void*)&(alloc4->payload)); 
-    // printf("alloc4->footer address      = %p \n", (void*)footer4);
+    new_alloc->header = SET_HEADER(size, 0);
+    block_t* footer = (block_t*)((char*)new_alloc + size - FOOTER_SIZE);
+    footer->header = SET_HEADER(size, 0);
+    
+    el = (block_t*)((char*)new_alloc + size);
+    el->header = SET_HEADER(0, 1);
 
-    // printf("sbrk end                    = %p \n", end);
+    return new_alloc;
+}
+
+block_t* find_alloc(uint64_t size)
+{
+    block_t* head = alloc_head; 
+    
+    while(get_size(head)>0) 
+    {
+        if (!get_alloc_status(head) && get_size(head) >= size)
+        {
+            allocate(head, size);
+            return head;
+        }
+        head = next_block(head);
+    }
+    block_t* new_alloc = extend_heap(size);
+    if (!new_alloc) return NULL;
+
+    allocate(new_alloc, size);
+    return new_alloc;
+}
+
+void* my_malloc(size_t sz)
+{
+    int alloc_size = ALIGN_UP(sz + HEADER_SIZE + FOOTER_SIZE, 16); 
+    block_t* new_alloc = NULL;
+    uint64_t* footer = NULL;
+
+    new_alloc = find_alloc(alloc_size);
+
+    return ((uint64_t*)new_alloc+1);
+}
+
+void my_free(void* alloc)
+{
+    block_t* alloc_start = (block_t*)((uint64_t*)alloc - 1);
+    int size = alloc_start->header>>0x4;
+    uint64_t* footer = (uint64_t*)((char*)alloc_start + (alloc_start->header>>0x4) - FOOTER_SIZE);
+
+    alloc_start->header &= ~0xF; 
+    *footer &= ~0xF;
 }
